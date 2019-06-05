@@ -10,6 +10,7 @@ import (
   "mime"
   "time"
   "fmt"
+  "sync"
   "path/filepath"
   "crypto/md5"
   "encoding/hex"
@@ -33,7 +34,8 @@ type cmd_callback func(url string, group []string) (string, string)
  */
 type cmd_filter func(int, string) bool
 
-type output_callback func([]string) error
+type output_callback func(string)
+type output_callback_int func(string, *sync.WaitGroup)
 
 type tagMap map[string]*tagTreeNode
 
@@ -46,6 +48,8 @@ type crawl_cmd struct {
 
 type tagTreeNode struct {
   tag string
+  counterMutex sync.Mutex
+  counter int
   parent *tagTreeNode
 }
 
@@ -55,7 +59,7 @@ type Gocrawler struct {
   proxyList []string
   proxyHealth []int
   proxyCounter int
-  outputCallback output_callback
+  outputCallback output_callback_int
 
   tagTreeRoot tagTreeNode
   tagNodeTable tagMap
@@ -69,11 +73,7 @@ type job struct {
 func New(target string, proxies []string) *Gocrawler {
   g := &Gocrawler{
     target: target,
-    commandLayer: nil,
     proxyList: proxies,
-    proxyHealth: nil,
-    proxyCounter: 0,
-    outputCallback: nil,
     tagNodeTable: make(tagMap),
   }
   g.tagNodeTable[target] = &g.tagTreeRoot
@@ -104,11 +104,18 @@ func(gcr *Gocrawler) Setproxies(proxies []string) {
   gcr.proxyList = append(gcr.proxyList, proxies...)
 }
 
-func(gcr *Gocrawler) SetOutputCallback(callback output_callback) {
-  gcr.outputCallback = callback
+func outputCallbackWrapper(callback output_callback) output_callback_int {
+  return func(url string, wg *sync.WaitGroup) {
+    callback(url)
+    wg.Done()
+  }
 }
 
-func(gcr *Gocrawler) Run() error {
+func(gcr *Gocrawler) SetOutputCallback(callback output_callback) {
+  gcr.outputCallback = outputCallbackWrapper(callback)
+}
+
+func(gcr *Gocrawler) Run() {
   var targetURLs []string
   var crawled []string
 
@@ -178,7 +185,14 @@ func(gcr *Gocrawler) Run() error {
     crawled = crawled[:0]
   }
 
-  return gcr.outputCallback(targetURLs)
+  var wg sync.WaitGroup
+
+  for _, url := range targetURLs {
+    go gcr.outputCallback(url, &wg)
+    wg.Add(1)
+  }
+
+  wg.Wait()
 }
 
 //func pickProxy(gcr *Gocrawler) string { }
@@ -248,10 +262,16 @@ func FetchImg() crawl_cmd {
   return crawl_cmd{compiled, -1, nil, callback}
 }
 
-func buildPath(gcr *Gocrawler, dir string, url string) string {
+func buildPath(gcr *Gocrawler, dir string, url string) (string, int) {
   var reversePath []string
   /* discard the last tag node */
   ptr := gcr.tagNodeTable[url].parent
+
+  ptr.counterMutex.Lock()
+  counter := ptr.counter
+  ptr.counter++
+  ptr.counterMutex.Unlock()
+
 
   for ptr != nil {
     reversePath = append(reversePath, ptr.tag)
@@ -263,57 +283,54 @@ func buildPath(gcr *Gocrawler, dir string, url string) string {
     path = filepath.Join(path, reversePath[i])
   }
 
-  return path
+  return path, counter
 }
 
 func(gcr *Gocrawler) DefaultDownloader(prefix string, path string) output_callback {
 
-  _downloader := func(prefix string, path string, urls []string) error {
-    for index, url := range urls {
+  _downloader := func(prefix string, path string, url string) {
 
-      // Get the data
-      res, err := http.Get(url)
-      if err != nil {
-        panic("Http GET error")
-      }
-
-      outputData, err := ioutil.ReadAll(res.Body)
-      if err != nil {
-        panic("Body read error")
-      }
-      defer res.Body.Close()
-
-      contentType := http.DetectContentType(outputData)
-      fileExtensions, err := mime.ExtensionsByType(contentType)
-
-      if err != nil {
-        panic("No matched file extension was found")
-      }
-
-      dirPath := buildPath(gcr, path, url)
-
-      fmt.Println(dirPath)
-
-      if _, err := os.Stat(dirPath); os.IsNotExist(err) {
-        os.MkdirAll(dirPath, 0755)
-      }
-
-      // Create the file
-      out, err := os.Create(filepath.Join(dirPath, prefix + strconv.Itoa(index) + fileExtensions[0]))
-      if err != nil {
-        panic("File creation failure")
-      }
-      defer out.Close()
-
-      // Write the body to file
-      _, err = out.Write(outputData)
-      if err != nil {
-        panic("File write error")
-      }
+    // Get the data
+    res, err := http.Get(url)
+    if err != nil {
+      panic("Http GET error")
     }
-    return nil
+
+    outputData, err := ioutil.ReadAll(res.Body)
+    if err != nil {
+      panic("Body read error")
+    }
+    defer res.Body.Close()
+
+    contentType := http.DetectContentType(outputData)
+    fileExtensions, err := mime.ExtensionsByType(contentType)
+
+    if err != nil {
+      panic("No matched file extension was found")
+    }
+
+    dirPath, index := buildPath(gcr, path, url)
+
+    fmt.Println(dirPath)
+
+    if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+      os.MkdirAll(dirPath, 0755)
+    }
+
+    // Create the file
+    out, err := os.Create(filepath.Join(dirPath, prefix + strconv.Itoa(index) + fileExtensions[0]))
+    if err != nil {
+      panic("File creation failure")
+    }
+    defer out.Close()
+
+    // Write the body to file
+    _, err = out.Write(outputData)
+    if err != nil {
+      panic("File write error")
+    }
   }
 
-  callback := func(urls []string) error { return _downloader(prefix, path, urls) }
+  callback := func(url string) { _downloader(prefix, path, url) }
   return callback
 }
