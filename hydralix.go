@@ -34,8 +34,9 @@ type cmd_callback func(url string, group []string) (string, string)
  */
 type cmd_filter func(int, string) bool
 
-type output_callback func(string)
-type output_callback_int func(string, *sync.WaitGroup)
+type output_async_callback func(string, *sync.Mutex)
+type output_sync_callback func([]string)
+type output_async_callback_int func(string, *sync.Mutex, *sync.WaitGroup)
 
 type tagMap map[string]*tagTreeNode
 
@@ -44,6 +45,7 @@ type crawl_cmd struct {
   matchTimes int
   filter cmd_filter
   callback cmd_callback
+  flat bool
 }
 
 type tagTreeNode struct {
@@ -59,7 +61,7 @@ type Hydra struct {
   proxyList []string
   proxyHealth []int
   proxyCounter int
-  outputCallback output_callback_int
+  outputCallback interface{}
 
   tagTreeRoot tagTreeNode
   tagNodeTable tagMap
@@ -87,7 +89,16 @@ func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callb
     panic("Regexp compilation failed")
   }
 
-  return crawl_cmd{compiled, matchTimes, filter, callback}
+  return crawl_cmd{compiled, matchTimes, filter, callback, true}
+}
+
+func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
+  compiled, err := regexp.Compile(regex)
+  if (err != nil) {
+    panic("Regexp compilation failed")
+  }
+
+  return crawl_cmd{compiled, matchTimes, filter, callback, false}
 }
 
 func(hydra *Hydra) Add(cmds ...crawl_cmd) {
@@ -104,15 +115,19 @@ func(hydra *Hydra) Setproxies(proxies []string) {
   hydra.proxyList = append(hydra.proxyList, proxies...)
 }
 
-func outputCallbackWrapper(callback output_callback) output_callback_int {
-  return func(url string, wg *sync.WaitGroup) {
-    callback(url)
+func outputCallbackWrapper(callback output_async_callback) output_async_callback_int {
+  return func(url string, mutex *sync.Mutex, wg *sync.WaitGroup) {
+    callback(url, mutex)
     wg.Done()
   }
 }
 
-func(hydra *Hydra) SetOutputCallback(callback output_callback) {
+func(hydra *Hydra) SetOutputAsyncCallback(callback output_async_callback) {
   hydra.outputCallback = outputCallbackWrapper(callback)
+}
+
+func(hydra *Hydra) SetOutputSyncCallback(callback output_sync_callback) {
+  hydra.outputCallback = callback
 }
 
 func(hydra *Hydra) Run() {
@@ -174,10 +189,18 @@ func(hydra *Hydra) Run() {
         if _, exist := hydra.tagNodeTable[processed]; exist {
           fmt.Println("[Warning] Fetched duplicate url, output may be corrupted")
         }
-        hydra.tagNodeTable[processed] = &tagTreeNode{
-          tag: tag,
-          parent: parentPtr,
+
+        var nodePtr *tagTreeNode
+        if cmd.flat {
+          nodePtr = parentPtr
+        } else {
+          nodePtr = &tagTreeNode{
+            tag: tag,
+            parent: parentPtr,
+          }
         }
+
+        hydra.tagNodeTable[processed] = nodePtr
       }
     }
     targetURLs = targetURLs[:0]
@@ -185,14 +208,20 @@ func(hydra *Hydra) Run() {
     crawled = crawled[:0]
   }
 
-  var wg sync.WaitGroup
+  switch callback := hydra.outputCallback.(type) {
+  case output_sync_callback:
+    callback(targetURLs)
 
-  for _, url := range targetURLs {
-    go hydra.outputCallback(url, &wg)
-    wg.Add(1)
+  case output_async_callback_int:
+    var wg sync.WaitGroup
+    var mutex sync.Mutex
+
+    for _, url := range targetURLs {
+      go callback(url, &mutex, &wg)
+      wg.Add(1)
+    }
+    wg.Wait()
   }
-
-  wg.Wait()
 }
 
 //func pickProxy(hydra *Hydra) string { }
@@ -259,7 +288,8 @@ func FetchImg() crawl_cmd {
     return modurl, group[0]
   }
 
-  return crawl_cmd{compiled, -1, nil, callback}
+  /* should be the final layer, so flat == true */
+  return crawl_cmd{compiled, -1, nil, callback, true}
 }
 
 func buildPath(hydra *Hydra, dir string, url string) (string, int) {
@@ -286,7 +316,7 @@ func buildPath(hydra *Hydra, dir string, url string) (string, int) {
   return path, counter
 }
 
-func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_callback {
+func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_async_callback {
 
   _downloader := func(prefix string, path string, url string) {
 
@@ -331,6 +361,6 @@ func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_callback
     }
   }
 
-  callback := func(url string) { _downloader(prefix, path, url) }
+  callback := func(url string, mutex *sync.Mutex) { _downloader(prefix, path, url) }
   return callback
 }
