@@ -1,4 +1,4 @@
-package gocrawler
+package hydralix
 
 import (
   "regexp"
@@ -28,7 +28,7 @@ import (
 type cmd_callback func(url string, group []string) (string, string)
 
 /* cmd_filter
- * @param {int} index of data
+ * @param {int} index of data (of the same regex match)
  * @param {string} cmd_callback processed data
  * @return {bool} choose or not
  */
@@ -53,7 +53,7 @@ type tagTreeNode struct {
   parent *tagTreeNode
 }
 
-type Gocrawler struct {
+type Hydra struct {
   target string
   commandLayer []crawl_cmd
   proxyList []string
@@ -70,8 +70,8 @@ type job struct {
   data string
 }
 
-func New(target string, proxies []string) *Gocrawler {
-  g := &Gocrawler{
+func New(target string, proxies []string) *Hydra {
+  g := &Hydra{
     target: target,
     proxyList: proxies,
     tagNodeTable: make(tagMap),
@@ -90,18 +90,18 @@ func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callb
   return crawl_cmd{compiled, matchTimes, filter, callback}
 }
 
-func(gcr *Gocrawler) Add(cmds ...crawl_cmd) {
+func(hydra *Hydra) Add(cmds ...crawl_cmd) {
   for _, cmd := range cmds {
-    gcr.commandLayer = append(gcr.commandLayer, cmd)
+    hydra.commandLayer = append(hydra.commandLayer, cmd)
   }
 }
 
-func(gcr *Gocrawler) Addlist(cmd []crawl_cmd) {
-  gcr.commandLayer = append(gcr.commandLayer, cmd...)
+func(hydra *Hydra) Addlist(cmd []crawl_cmd) {
+  hydra.commandLayer = append(hydra.commandLayer, cmd...)
 }
 
-func(gcr *Gocrawler) Setproxies(proxies []string) {
-  gcr.proxyList = append(gcr.proxyList, proxies...)
+func(hydra *Hydra) Setproxies(proxies []string) {
+  hydra.proxyList = append(hydra.proxyList, proxies...)
 }
 
 func outputCallbackWrapper(callback output_callback) output_callback_int {
@@ -111,19 +111,19 @@ func outputCallbackWrapper(callback output_callback) output_callback_int {
   }
 }
 
-func(gcr *Gocrawler) SetOutputCallback(callback output_callback) {
-  gcr.outputCallback = outputCallbackWrapper(callback)
+func(hydra *Hydra) SetOutputCallback(callback output_callback) {
+  hydra.outputCallback = outputCallbackWrapper(callback)
 }
 
-func(gcr *Gocrawler) Run() {
+func(hydra *Hydra) Run() {
   var targetURLs []string
   var crawled []string
 
-  targetURLs = append(targetURLs, gcr.target)
+  targetURLs = append(targetURLs, hydra.target)
 
-  for i := 0; i < len(gcr.commandLayer); i++ {
+  for i := 0; i < len(hydra.commandLayer); i++ {
     ch := make(chan job, 8)
-    cmd := &gcr.commandLayer[i]
+    cmd := &hydra.commandLayer[i]
 
     for i, url := range targetURLs {
       go request(url, cmd, ch)
@@ -170,11 +170,11 @@ func(gcr *Gocrawler) Run() {
           maybe change map[url(processed)]nodePtr -> map[tag]nodePtr ?
           : but you don't know the tag of download link in the outputCallback function
         */
-        parentPtr := gcr.tagNodeTable[res.url]
-        if _, exist := gcr.tagNodeTable[processed]; exist {
+        parentPtr := hydra.tagNodeTable[res.url]
+        if _, exist := hydra.tagNodeTable[processed]; exist {
           fmt.Println("[Warning] Fetched duplicate url, output may be corrupted")
         }
-        gcr.tagNodeTable[processed] = &tagTreeNode{
+        hydra.tagNodeTable[processed] = &tagTreeNode{
           tag: tag,
           parent: parentPtr,
         }
@@ -188,14 +188,14 @@ func(gcr *Gocrawler) Run() {
   var wg sync.WaitGroup
 
   for _, url := range targetURLs {
-    go gcr.outputCallback(url, &wg)
+    go hydra.outputCallback(url, &wg)
     wg.Add(1)
   }
 
   wg.Wait()
 }
 
-//func pickProxy(gcr *Gocrawler) string { }
+//func pickProxy(hydra *Hydra) string { }
 
 func request(url string, cmd *crawl_cmd, ch chan job) {
 
@@ -203,7 +203,7 @@ func request(url string, cmd *crawl_cmd, ch chan job) {
     MaxIdleConns:       10,
     IdleConnTimeout:    30 * time.Second,
     DisableCompression: true,
-    //Proxy:              http.ProxyURL(gcr.PickProxy()),
+    //Proxy:              http.ProxyURL(hydra.PickProxy()),
   }
 
   client := &http.Client{ Transport: tr }
@@ -262,10 +262,10 @@ func FetchImg() crawl_cmd {
   return crawl_cmd{compiled, -1, nil, callback}
 }
 
-func buildPath(gcr *Gocrawler, dir string, url string) (string, int) {
+func buildPath(hydra *Hydra, dir string, url string) (string, int) {
   var reversePath []string
   /* discard the last tag node */
-  ptr := gcr.tagNodeTable[url].parent
+  ptr := hydra.tagNodeTable[url].parent
 
   ptr.counterMutex.Lock()
   counter := ptr.counter
@@ -286,7 +286,7 @@ func buildPath(gcr *Gocrawler, dir string, url string) (string, int) {
   return path, counter
 }
 
-func(gcr *Gocrawler) DefaultDownloader(prefix string, path string) output_callback {
+func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_callback {
 
   _downloader := func(prefix string, path string, url string) {
 
@@ -309,7 +309,7 @@ func(gcr *Gocrawler) DefaultDownloader(prefix string, path string) output_callba
       panic("No matched file extension was found")
     }
 
-    dirPath, index := buildPath(gcr, path, url)
+    dirPath, index := buildPath(hydra, path, url)
 
     fmt.Println(dirPath)
 
