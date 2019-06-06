@@ -77,6 +77,8 @@ func New(target string, proxies []string) *Hydra {
     target: target,
     proxyList: proxies,
     tagNodeTable: make(tagMap),
+    commandLayer: nil,
+    outputCallback: nil,
   }
   g.tagNodeTable[target] = &g.tagTreeRoot
 
@@ -89,7 +91,7 @@ func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callb
     panic("Regexp compilation failed")
   }
 
-  return crawl_cmd{compiled, matchTimes, filter, callback, true}
+  return crawl_cmd{compiled, matchTimes, filter, callback, false}
 }
 
 func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
@@ -98,7 +100,7 @@ func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_c
     panic("Regexp compilation failed")
   }
 
-  return crawl_cmd{compiled, matchTimes, filter, callback, false}
+  return crawl_cmd{compiled, matchTimes, filter, callback, true}
 }
 
 func(hydra *Hydra) Add(cmds ...crawl_cmd) {
@@ -140,9 +142,9 @@ func(hydra *Hydra) Run() {
     ch := make(chan job, 8)
     cmd := &hydra.commandLayer[i]
 
-    for i, url := range targetURLs {
+    for _, url := range targetURLs {
       go request(url, cmd, ch)
-      fmt.Println("GO", i)
+      fmt.Println("[Request]", url)
     }
 
     for i := 0; i < len(targetURLs); i++ {
@@ -191,7 +193,7 @@ func(hydra *Hydra) Run() {
         }
 
         var nodePtr *tagTreeNode
-        if cmd.flat {
+        if cmd.flat == true {
           nodePtr = parentPtr
         } else {
           nodePtr = &tagTreeNode{
@@ -254,11 +256,13 @@ func request(url string, cmd *crawl_cmd, ch chan job) {
   }
   defer res.Body.Close()
 
+
   body, err := ioutil.ReadAll(res.Body)
   if err != nil {
     panic("Unable to read body")
   }
 
+  fmt.Println("[Response]", url, res.Status)
   ch <- job{url, string(body)}
 }
 
@@ -341,14 +345,13 @@ func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_async_ca
 
     dirPath, index := buildPath(hydra, path, url)
 
-    fmt.Println(dirPath)
-
     if _, err := os.Stat(dirPath); os.IsNotExist(err) {
       os.MkdirAll(dirPath, 0755)
     }
 
     // Create the file
-    out, err := os.Create(filepath.Join(dirPath, prefix + strconv.Itoa(index) + fileExtensions[0]))
+    file := filepath.Join(dirPath, prefix + strconv.Itoa(index) + fileExtensions[0])
+    out, err := os.Create(file)
     if err != nil {
       panic("File creation failure")
     }
@@ -359,6 +362,8 @@ func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_async_ca
     if err != nil {
       panic("File write error")
     }
+
+    fmt.Println("[Savefile]", file)
   }
 
   callback := func(url string, mutex *sync.Mutex) { _downloader(prefix, path, url) }
