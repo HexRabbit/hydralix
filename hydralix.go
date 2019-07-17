@@ -3,12 +3,12 @@ package hydralix
 import (
   "regexp"
   "io/ioutil"
+  "crypto/tls"
   neturl "net/url"
   "os"
   "strconv"
   "net/http"
   "mime"
-  "time"
   "fmt"
   "sync"
   "path/filepath"
@@ -20,9 +20,7 @@ import (
 // add some error handler
 /* cmd_callback
  * @param {string} crawled url
- * @param {string} matched group 1
- * @param {string} matched group 2
- * @param ...
+ * @param {string} matched group
  * @return {string} processed data
  */
 type cmd_callback func(url string, group []string) (string, string)
@@ -38,12 +36,22 @@ type output_async_callback func(string, *sync.Mutex)
 type output_sync_callback func([]string)
 type output_async_callback_int func(string, *sync.Mutex, *sync.WaitGroup)
 
+type output_callback_interface interface {}
+type cmd_interface interface {}
+
 type tagMap map[string]*tagTreeNode
 
 type crawl_cmd struct {
   regex *regexp.Regexp
   matchTimes int
   filter cmd_filter
+  callback cmd_callback
+  flat bool
+}
+
+type recur_cmd struct {
+  match *regexp.Regexp
+  collect *regexp.Regexp
   callback cmd_callback
   flat bool
 }
@@ -57,11 +65,12 @@ type tagTreeNode struct {
 
 type Hydra struct {
   target string
-  commandLayer []crawl_cmd
+  commandLayer []cmd_interface
   proxyList []string
   proxyHealth []int
   proxyCounter int
-  outputCallback interface{}
+  proxyMutex sync.Mutex
+  outputCallback output_callback_interface
 
   tagTreeRoot tagTreeNode
   tagNodeTable tagMap
@@ -72,10 +81,10 @@ type job struct {
   data string
 }
 
-func New(target string, proxies []string) *Hydra {
+func New(target string) *Hydra {
   g := &Hydra{
     target: target,
-    proxyList: proxies,
+    proxyList: nil,
     tagNodeTable: make(tagMap),
     commandLayer: nil,
     outputCallback: nil,
@@ -94,6 +103,20 @@ func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callb
   return crawl_cmd{compiled, matchTimes, filter, callback, false}
 }
 
+func CommandRecur(match string, collect string, callback cmd_callback) recur_cmd {
+  compiled_match, err := regexp.Compile(match)
+  if (err != nil) {
+    panic("Regexp compilation failed")
+  }
+
+  compiled_collect, err := regexp.Compile(collect)
+  if (err != nil) {
+    panic("Regexp compilation failed")
+  }
+
+  return recur_cmd{compiled_match, compiled_collect, callback, false}
+}
+
 func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
   compiled, err := regexp.Compile(regex)
   if (err != nil) {
@@ -103,13 +126,27 @@ func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_c
   return crawl_cmd{compiled, matchTimes, filter, callback, true}
 }
 
-func(hydra *Hydra) Add(cmds ...crawl_cmd) {
+func CommandRecurFlat(match string, collect string, callback cmd_callback) recur_cmd {
+  compiled_match, err := regexp.Compile(match)
+  if (err != nil) {
+    panic("Regexp compilation failed")
+  }
+
+  compiled_collect, err := regexp.Compile(collect)
+  if (err != nil) {
+    panic("Regexp compilation failed")
+  }
+
+  return recur_cmd{compiled_match, compiled_collect, callback, true}
+}
+
+func(hydra *Hydra) Add(cmds ...cmd_interface) {
   for _, cmd := range cmds {
     hydra.commandLayer = append(hydra.commandLayer, cmd)
   }
 }
 
-func(hydra *Hydra) Addlist(cmd []crawl_cmd) {
+func(hydra *Hydra) Addlist(cmd []cmd_interface) {
   hydra.commandLayer = append(hydra.commandLayer, cmd...)
 }
 
@@ -138,76 +175,163 @@ func(hydra *Hydra) Run() {
 
   targetURLs = append(targetURLs, hydra.target)
 
-  for i := 0; i < len(hydra.commandLayer); i++ {
-    ch := make(chan job, 8)
-    cmd := &hydra.commandLayer[i]
+  for layer := 0; layer < len(hydra.commandLayer); layer++ {
+    switch cmd := hydra.commandLayer[layer].(type) {
+    case crawl_cmd:
+      ch := make(chan job, 8)
 
-    for _, url := range targetURLs {
-      go request(url, cmd, ch)
-      fmt.Println("[Request]", url)
-    }
+      for _, url := range targetURLs {
+        go hydra.request(url, ch)
+        fmt.Println("[Request]", url)
+      }
 
-    for i := 0; i < len(targetURLs); i++ {
-      res := <-ch
+      for i := 0; i < len(targetURLs); i++ {
+        res := <-ch
 
-      re := cmd.regex
-      matched := re.FindAllStringSubmatch(res.data, cmd.matchTimes)
+        re := cmd.regex
+        matched := re.FindAllStringSubmatch(res.data, cmd.matchTimes)
 
-      for matched_idx, lst := range matched {
-        var processed, tag string
+        for matched_idx, lst := range matched {
+          /* tag is used for build tree and name the folder 
+             should be different from each other
+             or the mapping may failed
+          */
+          var processed, tag string
 
-        /* post-process */
-        if cmd.callback != nil {
-          processed, tag = cmd.callback(res.url, lst[1:])
+          /* post-process */
+          if cmd.callback != nil {
+            processed, tag = cmd.callback(res.url, lst[1:])
 
-        } else {
-          /* no callback: forward first matched group */
-          processed = lst[1]
+          } else {
+            /* no callback: forward first matched group */
+            processed = lst[1]
 
-          hasher := md5.New()
-          hasher.Write([]byte(lst[1]))
-          tag = hex.EncodeToString(hasher.Sum(nil))
+            hasher := md5.New()
+            hasher.Write([]byte(lst[1]))
+            tag = hex.EncodeToString(hasher.Sum(nil))
+          }
+
+          /* drop duplicated urls to avoid conflict */
+          if _, exist := hydra.tagNodeTable[processed]; exist {
+            fmt.Println("[Warning] Fetched duplicated url: %s", processed)
+            continue
+          }
+
+          /* filtering */
+          if cmd.filter != nil && cmd.filter(matched_idx, processed) {
+            crawled = append(crawled, processed)
+          } else if cmd.filter == nil {
+            crawled = append(crawled, processed)
+          }
+
+          /* build tree with tag */
+
+          /* by use of 
+            - res.url: 
+                should be used to search the parent tag node
+            - processed: 
+                used to build map[processed] = tag, point tag node to parent tag node
+                
+            maybe change map[url(processed)]nodePtr -> map[tag]nodePtr ?
+            : but you don't know the tag of download link in the outputCallback function
+          */
+          parentPtr := hydra.tagNodeTable[res.url]
+          var nodePtr *tagTreeNode
+
+          if cmd.flat {
+            nodePtr = parentPtr
+          } else {
+            nodePtr = &tagTreeNode{
+              tag: tag,
+              parent: parentPtr,
+            }
+          }
+
+          hydra.tagNodeTable[processed] = nodePtr
+        }
+      }
+
+      targetURLs = targetURLs[:0]
+      targetURLs = append(targetURLs, crawled...)
+      crawled = crawled[:0]
+
+    case recur_cmd:
+      var collection []string
+      ch := make(chan job, 8)
+
+      for len(targetURLs) > 0 {
+
+        for _, url := range targetURLs {
+          go hydra.request(url, ch)
+          fmt.Println("[Request]", url)
         }
 
-        /* filtering */
-        if cmd.filter != nil && cmd.filter(matched_idx, processed) {
-          crawled = append(crawled, processed)
-        } else if cmd.filter == nil {
-          crawled = append(crawled, processed)
-        }
+        for i := 0; i < len(targetURLs); i++ {
+          res := <-ch
 
-        /* build tree with tag */
+          match := cmd.match
+          matched := match.FindAllStringSubmatch(res.data, -1)
 
-        /* by use of 
-          - res.url: 
-              should be used to search the parent tag node
-          - processed: 
-              used to build map[processed] = tag, point tag node to parent tag node
-              
-          maybe change map[url(processed)]nodePtr -> map[tag]nodePtr ?
-          : but you don't know the tag of download link in the outputCallback function
-        */
-        parentPtr := hydra.tagNodeTable[res.url]
-        if _, exist := hydra.tagNodeTable[processed]; exist {
-          fmt.Println("[Warning] Fetched duplicate url, output may be corrupted")
-        }
+          collect := cmd.collect
+          collected := collect.FindAllStringSubmatch(res.data, -1)
 
-        var nodePtr *tagTreeNode
-        if cmd.flat == true {
-          nodePtr = parentPtr
-        } else {
-          nodePtr = &tagTreeNode{
-            tag: tag,
-            parent: parentPtr,
+          parentPtr := hydra.tagNodeTable[res.url]
+
+          for _, lst := range collected {
+            hydra.tagNodeTable[lst[1]] = parentPtr
+            collection = append(collection, lst[1])
+          }
+
+          for _, lst := range matched {
+            /* tag is used for build tree and name the folder 
+               should be different from each other
+               or the mapping may failed
+            */
+            var processed, tag string
+
+            /* post-process */
+            if cmd.callback != nil {
+              processed, tag = cmd.callback(res.url, lst[1:])
+
+            } else {
+              /* no callback: forward first matched group */
+              processed = lst[1]
+
+              hasher := md5.New()
+              hasher.Write([]byte(lst[1]))
+              tag = hex.EncodeToString(hasher.Sum(nil))
+            }
+
+
+            /* drop duplicated urls to avoid conflict */
+            if _, exist := hydra.tagNodeTable[processed]; exist {
+              fmt.Println("[Warning] Fetched duplicated url: %s", processed)
+              continue
+            }
+
+            crawled = append(crawled, processed)
+
+            var nodePtr *tagTreeNode
+
+            if cmd.flat {
+              nodePtr = parentPtr
+            } else {
+              nodePtr = &tagTreeNode{
+                tag: tag,
+                parent: parentPtr,
+              }
+            }
+
+            hydra.tagNodeTable[processed] = nodePtr
           }
         }
 
-        hydra.tagNodeTable[processed] = nodePtr
+        targetURLs = targetURLs[:0]
+        targetURLs = append(targetURLs, crawled...)
+        crawled = crawled[:0]
       }
+      targetURLs = append(targetURLs, collection...)
     }
-    targetURLs = targetURLs[:0]
-    targetURLs = append(targetURLs, crawled...)
-    crawled = crawled[:0]
   }
 
   switch callback := hydra.outputCallback.(type) {
@@ -226,18 +350,39 @@ func(hydra *Hydra) Run() {
   }
 }
 
-//func pickProxy(hydra *Hydra) string { }
+func(hydra *Hydra) pickProxy() func(*http.Request) (*neturl.URL, error) {
+  hydra.proxyMutex.Lock()
+  idx := hydra.proxyCounter % len(hydra.proxyList)
+  hydra.proxyCounter++
+  hydra.proxyMutex.Unlock()
 
-func request(url string, cmd *crawl_cmd, ch chan job) {
-
-  tr := &http.Transport{
-    MaxIdleConns:       10,
-    IdleConnTimeout:    30 * time.Second,
-    DisableCompression: true,
-    //Proxy:              http.ProxyURL(hydra.PickProxy()),
+  proxy := hydra.proxyList[idx]
+  httpProxy, err := neturl.Parse(proxy)
+  if err != nil {
+    panic("Parse proxy failed")
   }
 
-  client := &http.Client{ Transport: tr }
+  return http.ProxyURL(httpProxy)
+}
+
+func(hydra *Hydra) request(url string, ch chan job) {
+
+  RETRY:
+  tr := &http.Transport{
+    MaxIdleConns:       10,
+    //IdleConnTimeout:    30 * time.Second,
+    DisableCompression: true,
+    TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+  }
+
+  if hydra.proxyList != nil {
+    tr.Proxy = hydra.pickProxy()
+  }
+
+  client := &http.Client{
+    Transport: tr,
+    //Timeout: 8 * time.Second,
+  }
   req, err := http.NewRequest("GET", url, nil)
 
   if err != nil {
@@ -251,8 +396,10 @@ func request(url string, cmd *crawl_cmd, ch chan job) {
   res, err := client.Do(req)
 
   if err != nil {
+    fmt.Println(err)
+    goto RETRY
     /* maybe proxy fail */
-    panic("Proxy failed OR website not reachable")
+    //panic("Proxy failed or website is not reachable")
   }
   defer res.Body.Close()
 
@@ -263,13 +410,10 @@ func request(url string, cmd *crawl_cmd, ch chan job) {
   }
 
   fmt.Println("[Response]", url, res.Status)
+  if res.StatusCode != 200 {
+    goto RETRY
+  }
   ch <- job{url, string(body)}
-}
-
-func remove(s []int, i int) []int {
-  s[i] = s[len(s)-1]
-
-  return s[:len(s)-1]
 }
 
 func FetchImg() crawl_cmd {
