@@ -11,6 +11,7 @@ import (
   "mime"
   "fmt"
   "sync"
+  "bufio"
   "path/filepath"
   "crypto/md5"
   "encoding/hex"
@@ -464,6 +465,30 @@ func buildPath(hydra *Hydra, dir string, url string) (string, int) {
   return path, counter
 }
 
+func DefaultFileWriter(filepath string) output_sync_callback {
+  _writer := func(output []string) {
+
+    file, err := os.OpenFile(filepath, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, os.ModePerm)
+    if err != nil {
+      panic("File creation failure")
+    }
+    defer file.Close()
+
+    writer := bufio.NewWriter(file)
+    for _, str := range output {
+        writer.WriteString(str + "\n")
+    }
+
+    err = writer.Flush()
+    if err != nil {
+      panic("File write failure")
+    }
+  }
+
+  return _writer
+}
+
+/* TODO: Use callback to substitute hydra instance */
 func(hydra *Hydra) DefaultDownloader(prefix string, path string) output_async_callback {
 
   _downloader := func(prefix string, path string, url string) {
