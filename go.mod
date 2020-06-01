@@ -1,0 +1,8 @@
+module hydralix
+
+go 1.14
+
+require (
+	github.com/EDDYCJY/fake-useragent v0.2.0 // indirect
+	github.com/PuerkitoBio/goquery v1.5.1 // indirect
+)
