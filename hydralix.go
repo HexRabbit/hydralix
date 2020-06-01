@@ -95,16 +95,16 @@ func New(target string) *Hydra {
   return g
 }
 
-func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
+func buildCommand(regex string, matchTimes int, filter cmd_filter, callback cmd_callback, flat bool) crawl_cmd {
   compiled, err := regexp.Compile(regex)
   if (err != nil) {
     panic("Regexp compilation failed")
   }
 
-  return crawl_cmd{compiled, matchTimes, filter, callback, false}
+  return crawl_cmd{compiled, matchTimes, filter, callback, flat}
 }
 
-func CommandRecur(match string, collect string, callback cmd_callback) recur_cmd {
+func buildCommandRecur(match string, collect string, callback cmd_callback, flat bool) recur_cmd {
   compiled_match, err := regexp.Compile(match)
   if (err != nil) {
     panic("Regexp compilation failed")
@@ -115,30 +115,23 @@ func CommandRecur(match string, collect string, callback cmd_callback) recur_cmd
     panic("Regexp compilation failed")
   }
 
-  return recur_cmd{compiled_match, compiled_collect, callback, false}
+  return recur_cmd{compiled_match, compiled_collect, callback, flat}
+}
+
+func Command(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
+  return buildCommand(regex, matchTimes, filter, callback, false)
 }
 
 func CommandFlat(regex string, matchTimes int, filter cmd_filter, callback cmd_callback) crawl_cmd {
-  compiled, err := regexp.Compile(regex)
-  if (err != nil) {
-    panic("Regexp compilation failed")
-  }
+  return buildCommand(regex, matchTimes, filter, callback, true)
+}
 
-  return crawl_cmd{compiled, matchTimes, filter, callback, true}
+func CommandRecur(match string, collect string, callback cmd_callback) recur_cmd {
+  return buildCommandRecur(match, collect, callback, false)
 }
 
 func CommandRecurFlat(match string, collect string, callback cmd_callback) recur_cmd {
-  compiled_match, err := regexp.Compile(match)
-  if (err != nil) {
-    panic("Regexp compilation failed")
-  }
-
-  compiled_collect, err := regexp.Compile(collect)
-  if (err != nil) {
-    panic("Regexp compilation failed")
-  }
-
-  return recur_cmd{compiled_match, compiled_collect, callback, true}
+  return buildCommandRecur(match, collect, callback, true)
 }
 
 func(hydra *Hydra) Add(cmds ...cmd_interface) {
