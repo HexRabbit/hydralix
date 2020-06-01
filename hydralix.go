@@ -164,167 +164,174 @@ func (hydra *Hydra) SetOutputSyncCallback(callback output_sync_callback) {
 	hydra.outputCallback = callback
 }
 
+func (hydra *Hydra) doCrawlCommand(cmd crawl_cmd, targets []string) []string {
+	var crawled []string
+	ch := make(chan job, 8)
+
+	for _, url := range targets {
+		go hydra.request(url, ch)
+		fmt.Println("[Request]", url)
+	}
+
+	for i := 0; i < len(targets); i++ {
+		res := <-ch
+
+		re := cmd.regex
+		matched := re.FindAllStringSubmatch(res.data, cmd.matchTimes)
+
+		for matched_idx, lst := range matched {
+			/* tag is used for build tree and name the folder
+			   should be different from each other
+			   or the mapping may failed
+			*/
+			var processed, tag string
+
+			/* post-process */
+			if cmd.callback != nil {
+				processed, tag = cmd.callback(res.url, lst[1:])
+
+			} else {
+				/* no callback: forward first matched group */
+				processed = lst[1]
+
+				hasher := md5.New()
+				hasher.Write([]byte(lst[1]))
+				tag = hex.EncodeToString(hasher.Sum(nil))
+			}
+
+			/* drop duplicated urls to avoid conflict */
+			if _, exist := hydra.tagNodeTable[processed]; exist {
+				fmt.Println("[Warning] Fetched duplicated url:", processed)
+				continue
+			}
+
+			/* filtering */
+			if cmd.filter != nil && cmd.filter(matched_idx, processed) {
+				crawled = append(crawled, processed)
+			} else if cmd.filter == nil {
+				crawled = append(crawled, processed)
+			}
+
+			/* build tree with tag */
+
+			/* by use of
+			   - res.url:
+			       should be used to search the parent tag node
+			   - processed:
+			       used to build map[processed] = tag, point tag node to parent tag node
+
+			   maybe change map[url(processed)]nodePtr -> map[tag]nodePtr ?
+			   : but you don't know the tag of download link in the outputCallback function
+			*/
+			parentPtr := hydra.tagNodeTable[res.url]
+			var nodePtr *tagTreeNode
+
+			if cmd.flat {
+				nodePtr = parentPtr
+			} else {
+				nodePtr = &tagTreeNode{
+					tag:    tag,
+					parent: parentPtr,
+				}
+			}
+
+			hydra.tagNodeTable[processed] = nodePtr
+		}
+	}
+	return crawled
+}
+
+func (hydra *Hydra) doRecurCommand(cmd recur_cmd, targets []string) []string {
+	var collection []string
+	var crawl_targets []string
+	var crawled_url []string
+
+	crawl_targets = append(crawl_targets, targets...)
+	ch := make(chan job, 8)
+
+	for len(crawl_targets) > 0 {
+
+		for _, url := range crawl_targets {
+			go hydra.request(url, ch)
+			fmt.Println("[Request]", url)
+		}
+
+		for i := 0; i < len(crawl_targets); i++ {
+			res := <-ch
+
+			match := cmd.match
+			matched := match.FindAllStringSubmatch(res.data, -1)
+
+			collect := cmd.collect
+			collected := collect.FindAllStringSubmatch(res.data, -1)
+
+			parentPtr := hydra.tagNodeTable[res.url]
+
+			for _, lst := range collected {
+				hydra.tagNodeTable[lst[1]] = parentPtr
+				collection = append(collection, lst[1])
+			}
+
+			for _, lst := range matched {
+				/* tag is used for build tree and name the folder
+				   should be different from each other
+				   or the mapping may failed
+				*/
+				var processed, tag string
+
+				/* post-process */
+				if cmd.callback != nil {
+					processed, tag = cmd.callback(res.url, lst[1:])
+
+				} else {
+					/* no callback: forward first matched group */
+					processed = lst[1]
+
+					hasher := md5.New()
+					hasher.Write([]byte(lst[1]))
+					tag = hex.EncodeToString(hasher.Sum(nil))
+				}
+
+				/* drop duplicated urls to avoid conflict */
+				if _, exist := hydra.tagNodeTable[processed]; exist {
+					fmt.Println("[Warning] Fetched duplicated url:", processed)
+					continue
+				}
+
+				crawled_url = append(crawled_url, processed)
+
+				var nodePtr *tagTreeNode
+
+				if cmd.flat {
+					nodePtr = parentPtr
+				} else {
+					nodePtr = &tagTreeNode{
+						tag:    tag,
+						parent: parentPtr,
+					}
+				}
+
+				hydra.tagNodeTable[processed] = nodePtr
+			}
+		}
+		crawl_targets = crawled_url
+		crawled_url = []string{}
+	}
+
+	return collection
+}
+
 func (hydra *Hydra) Run() {
 	var targetURLs []string
-	var crawled []string
-
 	targetURLs = append(targetURLs, hydra.target)
 
 	for layer := 0; layer < len(hydra.commandLayer); layer++ {
 		switch cmd := hydra.commandLayer[layer].(type) {
 		case crawl_cmd:
-			ch := make(chan job, 8)
-
-			for _, url := range targetURLs {
-				go hydra.request(url, ch)
-				fmt.Println("[Request]", url)
-			}
-
-			for i := 0; i < len(targetURLs); i++ {
-				res := <-ch
-
-				re := cmd.regex
-				matched := re.FindAllStringSubmatch(res.data, cmd.matchTimes)
-
-				for matched_idx, lst := range matched {
-					/* tag is used for build tree and name the folder
-					   should be different from each other
-					   or the mapping may failed
-					*/
-					var processed, tag string
-
-					/* post-process */
-					if cmd.callback != nil {
-						processed, tag = cmd.callback(res.url, lst[1:])
-
-					} else {
-						/* no callback: forward first matched group */
-						processed = lst[1]
-
-						hasher := md5.New()
-						hasher.Write([]byte(lst[1]))
-						tag = hex.EncodeToString(hasher.Sum(nil))
-					}
-
-					/* drop duplicated urls to avoid conflict */
-					if _, exist := hydra.tagNodeTable[processed]; exist {
-						fmt.Println("[Warning] Fetched duplicated url:", processed)
-						continue
-					}
-
-					/* filtering */
-					if cmd.filter != nil && cmd.filter(matched_idx, processed) {
-						crawled = append(crawled, processed)
-					} else if cmd.filter == nil {
-						crawled = append(crawled, processed)
-					}
-
-					/* build tree with tag */
-
-					/* by use of
-					   - res.url:
-					       should be used to search the parent tag node
-					   - processed:
-					       used to build map[processed] = tag, point tag node to parent tag node
-
-					   maybe change map[url(processed)]nodePtr -> map[tag]nodePtr ?
-					   : but you don't know the tag of download link in the outputCallback function
-					*/
-					parentPtr := hydra.tagNodeTable[res.url]
-					var nodePtr *tagTreeNode
-
-					if cmd.flat {
-						nodePtr = parentPtr
-					} else {
-						nodePtr = &tagTreeNode{
-							tag:    tag,
-							parent: parentPtr,
-						}
-					}
-
-					hydra.tagNodeTable[processed] = nodePtr
-				}
-			}
-
-			targetURLs = targetURLs[:0]
-			targetURLs = append(targetURLs, crawled...)
-			crawled = crawled[:0]
+			targetURLs = hydra.doCrawlCommand(cmd, targetURLs)
 
 		case recur_cmd:
-			var collection []string
-			ch := make(chan job, 8)
-
-			for len(targetURLs) > 0 {
-
-				for _, url := range targetURLs {
-					go hydra.request(url, ch)
-					fmt.Println("[Request]", url)
-				}
-
-				for i := 0; i < len(targetURLs); i++ {
-					res := <-ch
-
-					match := cmd.match
-					matched := match.FindAllStringSubmatch(res.data, -1)
-
-					collect := cmd.collect
-					collected := collect.FindAllStringSubmatch(res.data, -1)
-
-					parentPtr := hydra.tagNodeTable[res.url]
-
-					for _, lst := range collected {
-						hydra.tagNodeTable[lst[1]] = parentPtr
-						collection = append(collection, lst[1])
-					}
-
-					for _, lst := range matched {
-						/* tag is used for build tree and name the folder
-						   should be different from each other
-						   or the mapping may failed
-						*/
-						var processed, tag string
-
-						/* post-process */
-						if cmd.callback != nil {
-							processed, tag = cmd.callback(res.url, lst[1:])
-
-						} else {
-							/* no callback: forward first matched group */
-							processed = lst[1]
-
-							hasher := md5.New()
-							hasher.Write([]byte(lst[1]))
-							tag = hex.EncodeToString(hasher.Sum(nil))
-						}
-
-						/* drop duplicated urls to avoid conflict */
-						if _, exist := hydra.tagNodeTable[processed]; exist {
-							fmt.Println("[Warning] Fetched duplicated url:", processed)
-							continue
-						}
-
-						crawled = append(crawled, processed)
-
-						var nodePtr *tagTreeNode
-
-						if cmd.flat {
-							nodePtr = parentPtr
-						} else {
-							nodePtr = &tagTreeNode{
-								tag:    tag,
-								parent: parentPtr,
-							}
-						}
-
-						hydra.tagNodeTable[processed] = nodePtr
-					}
-				}
-
-				targetURLs = targetURLs[:0]
-				targetURLs = append(targetURLs, crawled...)
-				crawled = crawled[:0]
-			}
-			targetURLs = append(targetURLs, collection...)
+			targetURLs = hydra.doRecurCommand(cmd, targetURLs)
 		}
 	}
 
