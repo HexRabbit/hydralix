@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"mime"
@@ -72,6 +73,7 @@ type Hydra struct {
 	proxyHealth    []int
 	proxyCounter   int
 	proxyMutex     sync.Mutex
+	reqMaxRetry    int
 	outputCallback output_callback_interface
 
 	tagTreeRoot  tagTreeNode
@@ -81,12 +83,14 @@ type Hydra struct {
 type job struct {
 	url  string
 	data string
+	err  error
 }
 
 func New(target string) *Hydra {
 	g := &Hydra{
 		target:         target,
 		proxyList:      nil,
+		reqMaxRetry:    5,
 		tagNodeTable:   make(tagMap),
 		commandLayer:   nil,
 		outputCallback: nil,
@@ -175,6 +179,10 @@ func (hydra *Hydra) doCrawlCommand(cmd crawl_cmd, targets []string) []string {
 
 	for i := 0; i < len(targets); i++ {
 		res := <-ch
+		if res.err != nil {
+			fmt.Println("[Warning]", res.err)
+			continue
+		}
 
 		re := cmd.regex
 		matched := re.FindAllStringSubmatch(res.data, cmd.matchTimes)
@@ -258,6 +266,10 @@ func (hydra *Hydra) doRecurCommand(cmd recur_cmd, targets []string) []string {
 
 		for i := 0; i < len(crawl_targets); i++ {
 			res := <-ch
+			if res.err != nil {
+				fmt.Println("[Warning]", res.err)
+				continue
+			}
 
 			match := cmd.match
 			matched := match.FindAllStringSubmatch(res.data, -1)
@@ -367,53 +379,63 @@ func (hydra *Hydra) pickProxy() func(*http.Request) (*neturl.URL, error) {
 }
 
 func (hydra *Hydra) request(url string, ch chan job) {
+	retry_cnt := 0
 
-RETRY:
-	tr := &http.Transport{
-		MaxIdleConns: 10,
-		//IdleConnTimeout:    30 * time.Second,
-		DisableCompression: true,
-		TLSNextProto:       make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	for retry_cnt < hydra.reqMaxRetry {
+		tr := &http.Transport{
+			MaxIdleConns: 10,
+			//IdleConnTimeout:    30 * time.Second,
+			DisableCompression: true,
+			TLSNextProto:       make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		}
+
+		if hydra.proxyList != nil {
+			tr.Proxy = hydra.pickProxy()
+		}
+
+		client := &http.Client{
+			Transport: tr,
+			//Timeout: 8 * time.Second,
+		}
+		req, err := http.NewRequest("GET", url, nil)
+
+		if err != nil {
+			panic("Request initialization failed")
+		}
+
+		req.Header.Set("User-Agent", browser.Random())
+		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+		req.Header.Set("Accept", "*/*")
+
+		res, err := client.Do(req)
+
+		if err != nil {
+			fmt.Println("[Warning]", err)
+			retry_cnt++
+			continue
+		}
+
+		body, err := ioutil.ReadAll(res.Body)
+		// It's guaranteed that Body is always non-nil, and since we may retry multiple times, just close it instantly after read is finished to avoid using too much connections
+		res.Body.Close()
+
+		if err != nil {
+			fmt.Println("[Warning]", err)
+			retry_cnt++
+			continue
+		}
+
+		fmt.Println("[Response]", url, res.Status)
+		if res.StatusCode != 200 {
+			retry_cnt++
+			continue
+		}
+
+		ch <- job{url, string(body), nil}
+		return
 	}
 
-	if hydra.proxyList != nil {
-		tr.Proxy = hydra.pickProxy()
-	}
-
-	client := &http.Client{
-		Transport: tr,
-		//Timeout: 8 * time.Second,
-	}
-	req, err := http.NewRequest("GET", url, nil)
-
-	if err != nil {
-		panic("Request initialization failed")
-	}
-
-	req.Header.Set("User-Agent", browser.Random())
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	req.Header.Set("Accept", "*/*")
-
-	res, err := client.Do(req)
-
-	if err != nil {
-		fmt.Println(err)
-		goto RETRY
-		/* maybe proxy fail */
-		//panic("Proxy failed or website is not reachable")
-	}
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		panic("Unable to read body")
-	}
-
-	fmt.Println("[Response]", url, res.Status)
-	if res.StatusCode != 200 {
-		goto RETRY
-	}
-	ch <- job{url, string(body)}
+	ch <- job{url, "", errors.New("Proxy failed or website is not reachable")}
 }
 
 func FetchImg() crawl_cmd {
